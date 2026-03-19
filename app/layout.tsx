@@ -1,10 +1,9 @@
 import type { Metadata } from "next";
-import "./globals.css";
-import { Providers } from "@/components/Providers";
+import Providers from "@/components/Providers";
 
 export const metadata: Metadata = {
-  title: "AI App",
-  description: "AI-powered application",
+  title: "Next.js App",
+  description: "Next.js application",
 };
 
 export default function RootLayout({
