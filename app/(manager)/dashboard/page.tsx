@@ -1,28 +1,43 @@
-import { Metadata } from "next";
 import { getServerSession } from "next-auth";
-import { redirect } from "next/navigation";
 import { authOptions } from "@/lib/auth";
+import { pool } from "@/lib/db";
 import ManagerDashboardClient from "./ManagerDashboardClient";
 
-export const metadata: Metadata = {
-  title: "Manager Dashboard",
-  description: "Manage your team and operations",
-};
+export interface Property {
+  id: string;
+  name: string;
+  address: string;
+  total_units: number;
+  occupied_units: number;
+  created_at: string;
+}
 
 export default async function ManagerDashboardPage() {
   const session = await getServerSession(authOptions);
 
-  if (!session) {
-    redirect("/login");
+  if (!session || !session.user) {
+    return (
+      <div className="flex items-center justify-center min-h-screen">
+        <p className="text-gray-500">Please sign in to access the dashboard.</p>
+      </div>
+    );
   }
 
-  if (session.user?.role !== "manager" && session.user?.role !== "admin") {
-    redirect("/unauthorized");
+  let properties: Property[] = [];
+
+  try {
+    const result = await pool.query<Property>(
+      `SELECT id, name, address, total_units, occupied_units, created_at
+       FROM properties
+       WHERE manager_id = $1
+       ORDER BY created_at DESC`,
+      [session.user.id],
+    );
+    properties = result.rows;
+  } catch (error) {
+    console.error("Failed to fetch properties:", error);
+    properties = [];
   }
 
-  return (
-    <main className="min-h-screen bg-gray-50">
-      <ManagerDashboardClient session={session} />
-    </main>
-  );
+  return <ManagerDashboardClient properties={properties} />;
 }

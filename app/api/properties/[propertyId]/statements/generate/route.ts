@@ -2,229 +2,472 @@ import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { db } from "@/lib/db";
-import Anthropic from "@anthropic-ai/sdk";
-import { put } from "@vercel/blob";
+import { renderToBuffer } from "@react-pdf/renderer";
+import { Document, Page, Text, View, StyleSheet } from "@react-pdf/renderer";
+import React from "react";
 import { z } from "zod";
 
-export const dynamic = "force-dynamic";
-
-const generateStatementsSchema = z.object({
-  period_start: z.string().min(1, "Period start is required"),
-  period_end: z.string().min(1, "Period end is required"),
-  statement_type: z
-    .enum(["monthly", "quarterly", "annual", "custom"])
-    .optional()
-    .default("monthly"),
-  include_charges: z.boolean().optional().default(true),
-  include_payments: z.boolean().optional().default(true),
-  include_balance: z.boolean().optional().default(true),
+const generateSchema = z.object({
+  leaseId: z.string().uuid(),
+  periodStart: z.string(),
+  periodEnd: z.string(),
+  includeCAM: z.boolean().optional().default(false),
 });
 
-interface Tenant {
-  tenant_id: string;
-  tenant_name: string;
-  tenant_email: string;
-  unit_number: string;
-  lease_id: string;
-  monthly_rent: number;
+const styles = StyleSheet.create({
+  page: {
+    padding: 40,
+    fontFamily: "Helvetica",
+    fontSize: 10,
+    color: "#333333",
+  },
+  header: {
+    marginBottom: 30,
+    borderBottomWidth: 2,
+    borderBottomColor: "#2563eb",
+    paddingBottom: 15,
+  },
+  title: {
+    fontSize: 24,
+    fontFamily: "Helvetica-Bold",
+    color: "#1e3a5f",
+    marginBottom: 4,
+  },
+  subtitle: {
+    fontSize: 12,
+    color: "#6b7280",
+  },
+  section: {
+    marginBottom: 20,
+  },
+  sectionTitle: {
+    fontSize: 13,
+    fontFamily: "Helvetica-Bold",
+    color: "#1e3a5f",
+    marginBottom: 8,
+    paddingBottom: 4,
+    borderBottomWidth: 1,
+    borderBottomColor: "#e5e7eb",
+  },
+  row: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    paddingVertical: 4,
+    paddingHorizontal: 8,
+  },
+  rowAlt: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    paddingVertical: 4,
+    paddingHorizontal: 8,
+    backgroundColor: "#f9fafb",
+  },
+  label: {
+    fontSize: 10,
+    color: "#374151",
+  },
+  value: {
+    fontSize: 10,
+    color: "#374151",
+    fontFamily: "Helvetica-Bold",
+  },
+  totalRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    paddingVertical: 8,
+    paddingHorizontal: 8,
+    backgroundColor: "#1e3a5f",
+    marginTop: 8,
+    borderRadius: 2,
+  },
+  totalLabel: {
+    fontSize: 12,
+    fontFamily: "Helvetica-Bold",
+    color: "#ffffff",
+  },
+  totalValue: {
+    fontSize: 12,
+    fontFamily: "Helvetica-Bold",
+    color: "#ffffff",
+  },
+  infoGrid: {
+    flexDirection: "row",
+    gap: 20,
+  },
+  infoColumn: {
+    flex: 1,
+  },
+  infoLabel: {
+    fontSize: 9,
+    color: "#9ca3af",
+    marginBottom: 2,
+    textTransform: "uppercase",
+  },
+  infoValue: {
+    fontSize: 10,
+    color: "#374151",
+    marginBottom: 8,
+  },
+  footer: {
+    position: "absolute",
+    bottom: 30,
+    left: 40,
+    right: 40,
+    borderTopWidth: 1,
+    borderTopColor: "#e5e7eb",
+    paddingTop: 8,
+    flexDirection: "row",
+    justifyContent: "space-between",
+  },
+  footerText: {
+    fontSize: 8,
+    color: "#9ca3af",
+  },
+  badge: {
+    backgroundColor: "#dcfce7",
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 10,
+    alignSelf: "flex-start",
+    marginTop: 4,
+  },
+  badgeText: {
+    fontSize: 9,
+    color: "#166534",
+    fontFamily: "Helvetica-Bold",
+  },
+  dueBadge: {
+    backgroundColor: "#fef3c7",
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 10,
+    alignSelf: "flex-start",
+    marginTop: 4,
+  },
+  dueBadgeText: {
+    fontSize: 9,
+    color: "#92400e",
+    fontFamily: "Helvetica-Bold",
+  },
+});
+
+interface StatementData {
+  property: {
+    name: string;
+    address: string;
+    city: string;
+    state: string;
+    zip: string;
+  };
+  tenant: {
+    name: string;
+    email: string;
+  };
+  lease: {
+    unit_number: string;
+    monthly_rent: number;
+    lease_start: string;
+    lease_end: string;
+  };
+  charges: Array<{
+    description: string;
+    amount: number;
+    type: string;
+  }>;
+  camCharges: Array<{
+    description: string;
+    amount: number;
+  }>;
+  periodStart: string;
+  periodEnd: string;
+  statementNumber: string;
+  generatedAt: string;
 }
 
-interface Charge {
-  charge_id: string;
-  tenant_id: string;
-  charge_date: string;
-  charge_type: string;
-  amount: number;
-  description: string;
-  status: string;
-}
+function StatementDocument({ data }: { data: StatementData }) {
+  const formatCurrency = (amount: number) =>
+    new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: "USD",
+    }).format(amount);
 
-interface Payment {
-  payment_id: string;
-  tenant_id: string;
-  payment_date: string;
-  amount: number;
-  payment_method: string;
-  reference_number: string;
-}
+  const formatDate = (dateStr: string) => {
+    const d = new Date(dateStr);
+    return d.toLocaleDateString("en-US", {
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+    });
+  };
 
-interface Property {
-  property_id: string;
-  property_name: string;
-  address: string;
-  owner_name: string;
-}
+  const baseChargesTotal = data.charges.reduce((sum, c) => sum + c.amount, 0);
+  const camTotal = data.camCharges.reduce((sum, c) => sum + c.amount, 0);
+  const grandTotal = baseChargesTotal + camTotal;
 
-function generatePDFContent(
-  tenant: Tenant,
-  property: Property,
-  charges: Charge[],
-  payments: Payment[],
-  periodStart: string,
-  periodEnd: string,
-  statementType: string,
-  includeCharges: boolean,
-  includePayments: boolean,
-  includeBalance: boolean,
-): Buffer {
-  const totalCharges = charges.reduce((sum, c) => sum + Number(c.amount), 0);
-  const totalPayments = payments.reduce((sum, p) => sum + Number(p.amount), 0);
-  const balance = totalCharges - totalPayments;
+  return React.createElement(
+    Document,
+    { title: `Statement ${data.statementNumber}` },
+    React.createElement(
+      Page,
+      { size: "LETTER", style: styles.page },
+      // Header
+      React.createElement(
+        View,
+        { style: styles.header },
+        React.createElement(Text, { style: styles.title }, "Rental Statement"),
+        React.createElement(
+          Text,
+          { style: styles.subtitle },
+          `Statement #${data.statementNumber}`,
+        ),
+      ),
 
-  const lines: string[] = [];
-  lines.push(`%PDF-1.4`);
-  lines.push(`1 0 obj`);
-  lines.push(`<< /Type /Catalog /Pages 2 0 R >>`);
-  lines.push(`endobj`);
-  lines.push(`2 0 obj`);
-  lines.push(`<< /Type /Pages /Kids [3 0 R] /Count 1 >>`);
-  lines.push(`endobj`);
+      // Property & Tenant Info
+      React.createElement(
+        View,
+        { style: styles.section },
+        React.createElement(
+          Text,
+          { style: styles.sectionTitle },
+          "Statement Information",
+        ),
+        React.createElement(
+          View,
+          { style: styles.infoGrid },
+          React.createElement(
+            View,
+            { style: styles.infoColumn },
+            React.createElement(Text, { style: styles.infoLabel }, "Property"),
+            React.createElement(
+              Text,
+              { style: styles.infoValue },
+              data.property.name,
+            ),
+            React.createElement(
+              Text,
+              { style: styles.infoLabel },
+              "Property Address",
+            ),
+            React.createElement(
+              Text,
+              { style: styles.infoValue },
+              `${data.property.address}, ${data.property.city}, ${data.property.state} ${data.property.zip}`,
+            ),
+            React.createElement(Text, { style: styles.infoLabel }, "Unit"),
+            React.createElement(
+              Text,
+              { style: styles.infoValue },
+              data.lease.unit_number,
+            ),
+          ),
+          React.createElement(
+            View,
+            { style: styles.infoColumn },
+            React.createElement(Text, { style: styles.infoLabel }, "Tenant"),
+            React.createElement(
+              Text,
+              { style: styles.infoValue },
+              data.tenant.name,
+            ),
+            React.createElement(
+              Text,
+              { style: styles.infoLabel },
+              "Statement Period",
+            ),
+            React.createElement(
+              Text,
+              { style: styles.infoValue },
+              `${formatDate(data.periodStart)} – ${formatDate(data.periodEnd)}`,
+            ),
+            React.createElement(
+              Text,
+              { style: styles.infoLabel },
+              "Generated On",
+            ),
+            React.createElement(
+              Text,
+              { style: styles.infoValue },
+              formatDate(data.generatedAt),
+            ),
+          ),
+        ),
+      ),
 
-  const contentLines: string[] = [];
-  contentLines.push(`BT`);
-  contentLines.push(`/F1 18 Tf`);
-  contentLines.push(`50 780 Td`);
-  contentLines.push(`(TENANT STATEMENT) Tj`);
-  contentLines.push(`/F1 12 Tf`);
-  contentLines.push(`0 -30 Td`);
-  contentLines.push(`(Property: ${property.property_name}) Tj`);
-  contentLines.push(`0 -20 Td`);
-  contentLines.push(`(Address: ${property.address}) Tj`);
-  contentLines.push(`0 -20 Td`);
-  contentLines.push(`(Tenant: ${tenant.tenant_name}) Tj`);
-  contentLines.push(`0 -20 Td`);
-  contentLines.push(`(Unit: ${tenant.unit_number}) Tj`);
-  contentLines.push(`0 -20 Td`);
-  contentLines.push(`(Email: ${tenant.tenant_email}) Tj`);
-  contentLines.push(`0 -20 Td`);
-  contentLines.push(`(Statement Period: ${periodStart} to ${periodEnd}) Tj`);
-  contentLines.push(`0 -20 Td`);
-  contentLines.push(`(Statement Type: ${statementType}) Tj`);
-  contentLines.push(`0 -20 Td`);
-  contentLines.push(
-    `(Monthly Rent: $${Number(tenant.monthly_rent).toFixed(2)}) Tj`,
+      // Lease Details
+      React.createElement(
+        View,
+        { style: styles.section },
+        React.createElement(
+          Text,
+          { style: styles.sectionTitle },
+          "Lease Details",
+        ),
+        React.createElement(
+          View,
+          { style: styles.rowAlt },
+          React.createElement(
+            Text,
+            { style: styles.label },
+            "Lease Start Date",
+          ),
+          React.createElement(
+            Text,
+            { style: styles.value },
+            formatDate(data.lease.lease_start),
+          ),
+        ),
+        React.createElement(
+          View,
+          { style: styles.row },
+          React.createElement(Text, { style: styles.label }, "Lease End Date"),
+          React.createElement(
+            Text,
+            { style: styles.value },
+            formatDate(data.lease.lease_end),
+          ),
+        ),
+        React.createElement(
+          View,
+          { style: styles.rowAlt },
+          React.createElement(
+            Text,
+            { style: styles.label },
+            "Monthly Base Rent",
+          ),
+          React.createElement(
+            Text,
+            { style: styles.value },
+            formatCurrency(data.lease.monthly_rent),
+          ),
+        ),
+      ),
+
+      // Charges
+      React.createElement(
+        View,
+        { style: styles.section },
+        React.createElement(
+          Text,
+          { style: styles.sectionTitle },
+          "Charges for Period",
+        ),
+        ...data.charges.map((charge, i) =>
+          React.createElement(
+            View,
+            {
+              key: `charge-${i}`,
+              style: i % 2 === 0 ? styles.rowAlt : styles.row,
+            },
+            React.createElement(
+              Text,
+              { style: styles.label },
+              charge.description,
+            ),
+            React.createElement(
+              Text,
+              { style: styles.value },
+              formatCurrency(charge.amount),
+            ),
+          ),
+        ),
+      ),
+
+      // CAM Charges (if any)
+      ...(data.camCharges.length > 0
+        ? [
+            React.createElement(
+              View,
+              { style: styles.section },
+              React.createElement(
+                Text,
+                { style: styles.sectionTitle },
+                "CAM Charges",
+              ),
+              ...data.camCharges.map((charge, i) =>
+                React.createElement(
+                  View,
+                  {
+                    key: `cam-${i}`,
+                    style: i % 2 === 0 ? styles.rowAlt : styles.row,
+                  },
+                  React.createElement(
+                    Text,
+                    { style: styles.label },
+                    charge.description,
+                  ),
+                  React.createElement(
+                    Text,
+                    { style: styles.value },
+                    formatCurrency(charge.amount),
+                  ),
+                ),
+              ),
+            ),
+          ]
+        : []),
+
+      // Total
+      React.createElement(
+        View,
+        { style: styles.totalRow },
+        React.createElement(
+          Text,
+          { style: styles.totalLabel },
+          "Total Amount Due",
+        ),
+        React.createElement(
+          Text,
+          { style: styles.totalValue },
+          formatCurrency(grandTotal),
+        ),
+      ),
+
+      // Footer
+      React.createElement(
+        View,
+        { style: styles.footer },
+        React.createElement(
+          Text,
+          { style: styles.footerText },
+          `${data.property.name} — ${data.property.address}, ${data.property.city}, ${data.property.state} ${data.property.zip}`,
+        ),
+        React.createElement(
+          Text,
+          { style: styles.footerText },
+          `Statement #${data.statementNumber} | Generated ${formatDate(data.generatedAt)}`,
+        ),
+      ),
+    ),
   );
-
-  if (includeCharges && charges.length > 0) {
-    contentLines.push(`0 -30 Td`);
-    contentLines.push(`/F1 14 Tf`);
-    contentLines.push(`(CHARGES) Tj`);
-    contentLines.push(`/F1 11 Tf`);
-    charges.forEach((charge) => {
-      contentLines.push(`0 -20 Td`);
-      contentLines.push(
-        `(${charge.charge_date} - ${charge.charge_type}: $${Number(charge.amount).toFixed(2)} - ${charge.description} [${charge.status}]) Tj`,
-      );
-    });
-    contentLines.push(`0 -20 Td`);
-    contentLines.push(`(Total Charges: $${totalCharges.toFixed(2)}) Tj`);
-  }
-
-  if (includePayments && payments.length > 0) {
-    contentLines.push(`0 -30 Td`);
-    contentLines.push(`/F1 14 Tf`);
-    contentLines.push(`(PAYMENTS) Tj`);
-    contentLines.push(`/F1 11 Tf`);
-    payments.forEach((payment) => {
-      contentLines.push(`0 -20 Td`);
-      contentLines.push(
-        `(${payment.payment_date} - ${payment.payment_method}: $${Number(payment.amount).toFixed(2)} Ref: ${payment.reference_number}) Tj`,
-      );
-    });
-    contentLines.push(`0 -20 Td`);
-    contentLines.push(`(Total Payments: $${totalPayments.toFixed(2)}) Tj`);
-  }
-
-  if (includeBalance) {
-    contentLines.push(`0 -30 Td`);
-    contentLines.push(`/F1 14 Tf`);
-    contentLines.push(`(BALANCE SUMMARY) Tj`);
-    contentLines.push(`/F1 12 Tf`);
-    contentLines.push(`0 -20 Td`);
-    contentLines.push(`(Total Charges: $${totalCharges.toFixed(2)}) Tj`);
-    contentLines.push(`0 -20 Td`);
-    contentLines.push(`(Total Payments: $${totalPayments.toFixed(2)}) Tj`);
-    contentLines.push(`0 -20 Td`);
-    contentLines.push(`(Balance Due: $${balance.toFixed(2)}) Tj`);
-  }
-
-  contentLines.push(`ET`);
-
-  const streamContent = contentLines.join("\n");
-
-  lines.push(`3 0 obj`);
-  lines.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]`);
-  lines.push(`/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>`);
-  lines.push(`endobj`);
-  lines.push(`4 0 obj`);
-  lines.push(`<< /Length ${streamContent.length} >>`);
-  lines.push(`stream`);
-  lines.push(streamContent);
-  lines.push(`endstream`);
-  lines.push(`endobj`);
-  lines.push(`5 0 obj`);
-  lines.push(`<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>`);
-  lines.push(`endobj`);
-  lines.push(`xref`);
-  lines.push(`0 6`);
-  lines.push(`0000000000 65535 f`);
-  lines.push(`trailer`);
-  lines.push(`<< /Size 6 /Root 1 0 R >>`);
-  lines.push(`startxref`);
-  lines.push(`0`);
-  lines.push(`%%EOF`);
-
-  return Buffer.from(lines.join("\n"), "utf-8");
 }
 
 export async function POST(
-  request: NextRequest,
+  req: NextRequest,
   { params }: { params: { propertyId: string } },
 ) {
   try {
     const session = await getServerSession(authOptions);
-    if (!session?.user) {
+    if (!session?.user?.id) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
+    const body = await req.json();
+    const parsed = generateSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(
+        { error: "Invalid request", details: parsed.error.flatten() },
+        { status: 400 },
+      );
+    }
+
+    const { leaseId, periodStart, periodEnd, includeCAM } = parsed.data;
     const { propertyId } = params;
 
-    if (!propertyId) {
-      return NextResponse.json(
-        { error: "Property ID is required" },
-        { status: 400 },
-      );
-    }
-
-    const body = await request.json();
-    const validationResult = generateStatementsSchema.safeParse(body);
-
-    if (!validationResult.success) {
-      return NextResponse.json(
-        {
-          error: "Validation failed",
-          details: validationResult.error.flatten(),
-        },
-        { status: 400 },
-      );
-    }
-
-    const {
-      period_start,
-      period_end,
-      statement_type,
-      include_charges,
-      include_payments,
-      include_balance,
-    } = validationResult.data;
-
-    // Verify property exists and user has access
+    // Verify property ownership
     const propertyResult = await db.query(
-      `SELECT p.property_id, p.property_name, p.address, 
-              COALESCE(u.name, u.email) as owner_name
+      `SELECT p.id, p.name, p.address, p.city, p.state, p.zip
        FROM properties p
-       LEFT JOIN users u ON p.owner_id = u.id
-       WHERE p.property_id = $1 AND p.owner_id = $2`,
+       WHERE p.id = $1 AND p.manager_id = $2`,
       [propertyId, session.user.id],
     );
 
@@ -235,219 +478,136 @@ export async function POST(
       );
     }
 
-    const property: Property = propertyResult.rows[0];
+    const property = propertyResult.rows[0];
 
-    // Get all active tenants for this property
-    const tenantsResult = await db.query(
-      `SELECT t.tenant_id, t.name as tenant_name, t.email as tenant_email,
-              u.unit_number, l.lease_id, l.monthly_rent
-       FROM tenants t
-       JOIN leases l ON t.tenant_id = l.tenant_id
-       JOIN units u ON l.unit_id = u.unit_id
-       WHERE u.property_id = $1 
-         AND l.status = 'active'
-         AND l.start_date <= $2
-         AND (l.end_date IS NULL OR l.end_date >= $3)`,
-      [propertyId, period_end, period_start],
+    // Get lease and tenant info
+    const leaseResult = await db.query(
+      `SELECT l.id, l.unit_number, l.monthly_rent, l.lease_start, l.lease_end,
+              u.id as tenant_id, u.name as tenant_name, u.email as tenant_email
+       FROM leases l
+       JOIN users u ON l.tenant_id = u.id
+       WHERE l.id = $1 AND l.property_id = $2`,
+      [leaseId, propertyId],
     );
 
-    if (tenantsResult.rows.length === 0) {
-      return NextResponse.json(
+    if (leaseResult.rows.length === 0) {
+      return NextResponse.json({ error: "Lease not found" }, { status: 404 });
+    }
+
+    const lease = leaseResult.rows[0];
+
+    // Get charges for the period
+    const chargesResult = await db.query(
+      `SELECT description, amount, charge_type as type
+       FROM charges
+       WHERE lease_id = $1
+         AND charge_date >= $2
+         AND charge_date <= $3
+       ORDER BY charge_date ASC`,
+      [leaseId, periodStart, periodEnd],
+    );
+
+    // If no charges found, create a default rent charge
+    let charges = chargesResult.rows;
+    if (charges.length === 0) {
+      charges = [
         {
-          error:
-            "No active tenants found for this property in the specified period",
+          description: "Monthly Rent",
+          amount: parseFloat(lease.monthly_rent),
+          type: "rent",
         },
-        { status: 404 },
-      );
+      ];
     }
 
-    const tenants: Tenant[] = tenantsResult.rows;
-    const generatedStatements: Array<{
-      tenant_id: string;
-      tenant_name: string;
-      statement_id: string;
-      blob_url: string;
-      total_charges: number;
-      total_payments: number;
-      balance: number;
-    }> = [];
-
-    const anthropic = new Anthropic();
-
-    for (const tenant of tenants) {
-      // Get charges for this tenant in the period
-      const chargesResult = await db.query(
-        `SELECT charge_id, tenant_id, charge_date::text, charge_type, 
-                amount, description, status
-         FROM charges
-         WHERE tenant_id = $1
-           AND charge_date >= $2
-           AND charge_date <= $3
-         ORDER BY charge_date ASC`,
-        [tenant.tenant_id, period_start, period_end],
+    // Get CAM charges if requested
+    let camCharges: Array<{ description: string; amount: number }> = [];
+    if (includeCAM) {
+      const camResult = await db.query(
+        `SELECT cc.description, cc.tenant_share as amount
+         FROM cam_charges cc
+         JOIN cam_pools cp ON cc.cam_pool_id = cp.id
+         WHERE cp.property_id = $1
+           AND cc.lease_id = $2
+           AND cc.period_start >= $3
+           AND cc.period_end <= $4
+         ORDER BY cc.created_at ASC`,
+        [propertyId, leaseId, periodStart, periodEnd],
       );
-
-      // Get payments for this tenant in the period
-      const paymentsResult = await db.query(
-        `SELECT payment_id, tenant_id, payment_date::text, amount, 
-                payment_method, COALESCE(reference_number, '') as reference_number
-         FROM payments
-         WHERE tenant_id = $1
-           AND payment_date >= $2
-           AND payment_date <= $3
-         ORDER BY payment_date ASC`,
-        [tenant.tenant_id, period_start, period_end],
-      );
-
-      const charges: Charge[] = chargesResult.rows;
-      const payments: Payment[] = paymentsResult.rows;
-
-      const totalCharges = charges.reduce(
-        (sum, c) => sum + Number(c.amount),
-        0,
-      );
-      const totalPayments = payments.reduce(
-        (sum, p) => sum + Number(p.amount),
-        0,
-      );
-      const balance = totalCharges - totalPayments;
-
-      // Use Anthropic to generate a summary/notes for the statement
-      let statementNotes = "";
-      try {
-        const aiResponse = await anthropic.messages.create({
-          model: "claude-opus-4-5",
-          max_tokens: 300,
-          messages: [
-            {
-              role: "user",
-              content: `Generate a brief, professional statement summary note for a tenant statement with the following details:
-              - Tenant: ${tenant.tenant_name}
-              - Period: ${period_start} to ${period_end}
-              - Total Charges: $${totalCharges.toFixed(2)}
-              - Total Payments: $${totalPayments.toFixed(2)}
-              - Balance Due: $${balance.toFixed(2)}
-              - Number of charges: ${charges.length}
-              - Number of payments: ${payments.length}
-              
-              Keep it to 2-3 sentences, professional and informative.`,
-            },
-          ],
-        });
-
-        const textContent = aiResponse.content.find((c) => c.type === "text");
-        if (textContent && textContent.type === "text") {
-          statementNotes = textContent.text;
-        }
-      } catch (aiError) {
-        console.error("AI summary generation failed:", aiError);
-        statementNotes = `Statement for ${tenant.tenant_name} covering ${period_start} to ${period_end}.`;
-      }
-
-      // Generate PDF
-      const pdfBuffer = generatePDFContent(
-        tenant,
-        property,
-        charges,
-        payments,
-        period_start,
-        period_end,
-        statement_type,
-        include_charges,
-        include_payments,
-        include_balance,
-      );
-
-      // Upload to Vercel Blob
-      const fileName = `statements/${propertyId}/${tenant.tenant_id}/${statement_type}_${period_start}_${period_end}_${Date.now()}.pdf`;
-
-      const blob = await put(fileName, pdfBuffer, {
-        access: "public",
-        contentType: "application/pdf",
-      });
-
-      // Insert record into reconciliation_statements table
-      const statementResult = await db.query(
-        `INSERT INTO reconciliation_statements (
-          property_id,
-          tenant_id,
-          lease_id,
-          period_start,
-          period_end,
-          statement_type,
-          total_charges,
-          total_payments,
-          balance,
-          blob_url,
-          notes,
-          generated_by,
-          generated_at,
-          status
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), $13)
-        RETURNING statement_id`,
-        [
-          propertyId,
-          tenant.tenant_id,
-          tenant.lease_id,
-          period_start,
-          period_end,
-          statement_type,
-          totalCharges,
-          totalPayments,
-          balance,
-          blob.url,
-          statementNotes,
-          session.user.id,
-          "generated",
-        ],
-      );
-
-      const statementId = statementResult.rows[0].statement_id;
-
-      generatedStatements.push({
-        tenant_id: tenant.tenant_id,
-        tenant_name: tenant.tenant_name,
-        statement_id: statementId,
-        blob_url: blob.url,
-        total_charges: totalCharges,
-        total_payments: totalPayments,
-        balance: balance,
-      });
+      camCharges = camResult.rows;
     }
 
-    return NextResponse.json(
-      {
-        success: true,
-        message: `Successfully generated ${generatedStatements.length} statement(s)`,
-        property: {
-          property_id: property.property_id,
-          property_name: property.property_name,
-        },
-        period: {
-          start: period_start,
-          end: period_end,
-          type: statement_type,
-        },
-        statements: generatedStatements,
-        total_generated: generatedStatements.length,
+    // Generate statement number
+    const statementNumber = `STMT-${Date.now()}-${Math.random().toString(36).substr(2, 6).toUpperCase()}`;
+    const generatedAt = new Date().toISOString().split("T")[0];
+
+    const statementData: StatementData = {
+      property: {
+        name: property.name,
+        address: property.address,
+        city: property.city,
+        state: property.state,
+        zip: property.zip,
       },
-      { status: 201 },
+      tenant: {
+        name: lease.tenant_name,
+        email: lease.tenant_email,
+      },
+      lease: {
+        unit_number: lease.unit_number,
+        monthly_rent: parseFloat(lease.monthly_rent),
+        lease_start: lease.lease_start,
+        lease_end: lease.lease_end,
+      },
+      charges,
+      camCharges,
+      periodStart,
+      periodEnd,
+      statementNumber,
+      generatedAt,
+    };
+
+    // Render PDF using @react-pdf/renderer
+    const pdfBuffer = await renderToBuffer(
+      React.createElement(StatementDocument, { data: statementData }),
     );
-  } catch (error) {
-    console.error("Error generating statements:", error);
 
-    if (error instanceof z.ZodError) {
-      return NextResponse.json(
-        { error: "Validation error", details: error.flatten() },
-        { status: 400 },
-      );
-    }
+    // Save statement record to database
+    await db.query(
+      `INSERT INTO statements (
+         id, property_id, lease_id, tenant_id, statement_number,
+         period_start, period_end, total_amount, generated_at, generated_by
+       ) VALUES (
+         gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, NOW(), $8
+       )
+       ON CONFLICT (statement_number) DO NOTHING`,
+      [
+        propertyId,
+        leaseId,
+        lease.tenant_id,
+        statementNumber,
+        periodStart,
+        periodEnd,
+        charges.reduce(
+          (sum: number, c: { amount: number }) => sum + c.amount,
+          0,
+        ) + camCharges.reduce((sum, c) => sum + c.amount, 0),
+        session.user.id,
+      ],
+    );
 
-    return NextResponse.json(
-      {
-        error: "Internal server error",
-        message: "Failed to generate statements",
+    return new NextResponse(pdfBuffer, {
+      status: 200,
+      headers: {
+        "Content-Type": "application/pdf",
+        "Content-Disposition": `attachment; filename="statement-${statementNumber}.pdf"`,
+        "Content-Length": pdfBuffer.length.toString(),
+        "Cache-Control": "no-store",
       },
+    });
+  } catch (error) {
+    console.error("Error generating statement PDF:", error);
+    return NextResponse.json(
+      { error: "Failed to generate statement" },
       { status: 500 },
     );
   }

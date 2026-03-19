@@ -1,396 +1,167 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+import { query } from "@/lib/db";
 import { z } from "zod";
-import pg from "pg";
 
-const { Pool } = pg;
-
-export const dynamic = "force-dynamic";
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl:
-    process.env.NODE_ENV === "production"
-      ? { rejectUnauthorized: false }
-      : false,
-});
-
-const CalculateRequestSchema = z.object({
+const calculateSchema = z.object({
   year: z.number().int().min(2000).max(2100),
-  month: z.number().int().min(1).max(12).optional(),
-  pool_name: z.string().optional(),
-  recalculate: z.boolean().optional().default(false),
+  totalExpenses: z.number().positive(),
 });
-
-interface ExpenseLineItem {
-  id: string;
-  property_id: string;
-  amount: number;
-  category: string;
-  description: string;
-  expense_date: string;
-  cam_eligible: boolean;
-  cam_pool_id: string | null;
-}
-
-interface Tenant {
-  id: string;
-  property_id: string;
-  name: string;
-  unit_id: string;
-  lease_start: string;
-  lease_end: string;
-  rentable_area: number;
-  pro_rata_share: number | null;
-}
-
-interface CamPool {
-  id: string;
-  property_id: string;
-  name: string;
-  year: number;
-  month: number | null;
-  total_expenses: number;
-  total_rentable_area: number;
-  status: string;
-}
-
-interface AllocationResult {
-  tenant_id: string;
-  tenant_name: string;
-  rentable_area: number;
-  pro_rata_share: number;
-  allocated_amount: number;
-  cam_pool_id: string;
-}
-
-async function computeCamAllocations(
-  expenses: ExpenseLineItem[],
-  tenants: Tenant[],
-  propertyId: string,
-  year: number,
-  month: number | null,
-  poolName: string,
-): Promise<{
-  totalExpenses: number;
-  totalRentableArea: number;
-  allocations: AllocationResult[];
-  camPool: Partial<CamPool>;
-}> {
-  const totalExpenses = expenses.reduce((sum, e) => sum + Number(e.amount), 0);
-
-  const activeTenants = tenants.filter((t) => {
-    const leaseStart = new Date(t.lease_start);
-    const leaseEnd = new Date(t.lease_end);
-    const periodStart = month
-      ? new Date(year, month - 1, 1)
-      : new Date(year, 0, 1);
-    const periodEnd = month ? new Date(year, month, 0) : new Date(year, 11, 31);
-
-    return leaseStart <= periodEnd && leaseEnd >= periodStart;
-  });
-
-  const totalRentableArea = activeTenants.reduce(
-    (sum, t) => sum + Number(t.rentable_area),
-    0,
-  );
-
-  const allocations: AllocationResult[] = activeTenants.map((tenant) => {
-    const proRataShare =
-      totalRentableArea > 0
-        ? Number(tenant.rentable_area) / totalRentableArea
-        : 0;
-    const allocatedAmount = totalExpenses * proRataShare;
-
-    return {
-      tenant_id: tenant.id,
-      tenant_name: tenant.name,
-      rentable_area: Number(tenant.rentable_area),
-      pro_rata_share: proRataShare,
-      allocated_amount: allocatedAmount,
-      cam_pool_id: "",
-    };
-  });
-
-  const camPool: Partial<CamPool> = {
-    property_id: propertyId,
-    name: poolName,
-    year,
-    month: month ?? null,
-    total_expenses: totalExpenses,
-    total_rentable_area: totalRentableArea,
-    status: "calculated",
-  };
-
-  return { totalExpenses, totalRentableArea, allocations, camPool };
-}
 
 export async function POST(
-  request: NextRequest,
+  req: NextRequest,
   { params }: { params: { propertyId: string } },
 ) {
-  const session = await getServerSession();
-  if (!session?.user) {
+  const session = await getServerSession(authOptions);
+
+  if (!session || !session.user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   const { propertyId } = params;
 
-  if (!propertyId) {
-    return NextResponse.json(
-      { error: "Property ID is required" },
-      { status: 400 },
-    );
-  }
-
   let body: unknown;
   try {
-    body = await request.json();
+    body = await req.json();
   } catch {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  const parseResult = CalculateRequestSchema.safeParse(body);
-  if (!parseResult.success) {
+  const parsed = calculateSchema.safeParse(body);
+  if (!parsed.success) {
     return NextResponse.json(
-      { error: "Validation failed", details: parseResult.error.flatten() },
+      { error: "Validation failed", details: parsed.error.flatten() },
       { status: 422 },
     );
   }
 
-  const { year, month, pool_name, recalculate } = parseResult.data;
-  const poolName =
-    pool_name ||
-    (month
-      ? `CAM Pool ${year}-${String(month).padStart(2, "0")}`
-      : `CAM Pool ${year}`);
-
-  const client = await pool.connect();
+  const { year, totalExpenses } = parsed.data;
 
   try {
-    await client.query("BEGIN");
-
-    const propertyCheck = await client.query(
-      "SELECT id FROM properties WHERE id = $1",
-      [propertyId],
+    // Verify the property belongs to the authenticated user (manager)
+    const propertyResult = await query(
+      `SELECT id, name FROM properties WHERE id = $1 AND manager_id = $2`,
+      [propertyId, session.user.id],
     );
 
-    if (propertyCheck.rows.length === 0) {
-      await client.query("ROLLBACK");
+    if (propertyResult.rows.length === 0) {
       return NextResponse.json(
-        { error: "Property not found" },
+        { error: "Property not found or access denied" },
         { status: 404 },
       );
     }
 
-    const existingPoolQuery = month
-      ? await client.query(
-          "SELECT id, status FROM cam_pools WHERE property_id = $1 AND year = $2 AND month = $3",
-          [propertyId, year, month],
-        )
-      : await client.query(
-          "SELECT id, status FROM cam_pools WHERE property_id = $1 AND year = $2 AND month IS NULL",
-          [propertyId, year],
-        );
-
-    if (existingPoolQuery.rows.length > 0 && !recalculate) {
-      await client.query("ROLLBACK");
-      return NextResponse.json(
-        {
-          error:
-            "CAM pool already exists for this period. Use recalculate=true to override.",
-          existing_pool_id: existingPoolQuery.rows[0].id,
-        },
-        { status: 409 },
-      );
-    }
-
-    const expensesResult = await client.query<ExpenseLineItem>(
-      `SELECT id, property_id, amount, category, description, expense_date, cam_eligible, cam_pool_id
-       FROM expense_line_items
-       WHERE property_id = $1
-         AND cam_eligible = true
-         AND EXTRACT(YEAR FROM expense_date) = $2
-         ${month ? "AND EXTRACT(MONTH FROM expense_date) = $3" : ""}
-       ORDER BY expense_date ASC`,
-      month ? [propertyId, year, month] : [propertyId, year],
+    // Fetch all active leases for this property with their CAM pool data
+    const leasesResult = await query(
+      `SELECT
+        l.id,
+        l.tenant_id,
+        l.unit_id,
+        l.rentable_sqft,
+        l.cam_share_pct,
+        l.cam_cap_pct,
+        l.cam_base_year,
+        u.unit_number,
+        t.name AS tenant_name
+      FROM leases l
+      JOIN units u ON u.id = l.unit_id
+      JOIN tenants t ON t.id = l.tenant_id
+      WHERE u.property_id = $1
+        AND l.status = 'active'
+        AND l.start_date <= make_date($2, 12, 31)
+        AND (l.end_date IS NULL OR l.end_date >= make_date($2, 1, 1))`,
+      [propertyId, year],
     );
 
-    const expenses = expensesResult.rows;
+    const leases = leasesResult.rows;
 
-    if (expenses.length === 0) {
-      await client.query("ROLLBACK");
+    if (leases.length === 0) {
       return NextResponse.json(
-        {
-          error: "No CAM-eligible expenses found for the specified period",
-          year,
-          month: month ?? null,
-        },
+        { error: "No active leases found for this property in the given year" },
         { status: 404 },
       );
     }
 
-    const tenantsResult = await client.query<Tenant>(
-      `SELECT t.id, t.property_id, t.name, t.unit_id, t.lease_start, t.lease_end,
-              u.rentable_area, t.pro_rata_share
-       FROM tenants t
-       JOIN units u ON t.unit_id = u.id
-       WHERE t.property_id = $1
-         AND t.lease_start IS NOT NULL
-         AND t.lease_end IS NOT NULL
-       ORDER BY t.name ASC`,
-      [propertyId],
+    // Calculate total rentable sqft across all active leases
+    const totalRentableSqft = leases.reduce(
+      (sum: number, lease: { rentable_sqft: number }) =>
+        sum + Number(lease.rentable_sqft),
+      0,
     );
 
-    const tenants = tenantsResult.rows;
+    // Calculate each tenant's CAM contribution
+    const camAllocations = leases.map(
+      (lease: {
+        id: string;
+        tenant_id: string;
+        unit_id: string;
+        rentable_sqft: number;
+        cam_share_pct: number | null;
+        cam_cap_pct: number | null;
+        cam_base_year: number | null;
+        unit_number: string;
+        tenant_name: string;
+      }) => {
+        const sharePercent =
+          lease.cam_share_pct !== null
+            ? Number(lease.cam_share_pct)
+            : totalRentableSqft > 0
+              ? (Number(lease.rentable_sqft) / totalRentableSqft) * 100
+              : 0;
 
-    if (tenants.length === 0) {
-      await client.query("ROLLBACK");
-      return NextResponse.json(
-        { error: "No tenants found for this property" },
-        { status: 404 },
-      );
-    }
+        let allocatedAmount = (sharePercent / 100) * totalExpenses;
 
-    const { totalExpenses, totalRentableArea, allocations, camPool } =
-      await computeCamAllocations(
-        expenses,
-        tenants,
-        propertyId,
-        year,
-        month ?? null,
-        poolName,
-      );
+        // Apply CAM cap if defined
+        if (lease.cam_cap_pct !== null && lease.cam_base_year !== null) {
+          const yearsElapsed = year - Number(lease.cam_base_year);
+          if (yearsElapsed > 0) {
+            const capMultiplier = Math.pow(
+              1 + Number(lease.cam_cap_pct) / 100,
+              yearsElapsed,
+            );
+            const baseAmount = (sharePercent / 100) * totalExpenses;
+            const cappedAmount = baseAmount * capMultiplier;
+            allocatedAmount = Math.min(allocatedAmount, cappedAmount);
+          }
+        }
 
-    let camPoolId: string;
-
-    if (existingPoolQuery.rows.length > 0 && recalculate) {
-      const existingId = existingPoolQuery.rows[0].id;
-
-      await client.query(
-        `UPDATE cam_pools
-         SET name = $1, total_expenses = $2, total_rentable_area = $3,
-             status = $4, updated_at = NOW()
-         WHERE id = $5`,
-        [
-          camPool.name,
-          camPool.total_expenses,
-          camPool.total_rentable_area,
-          camPool.status,
-          existingId,
-        ],
-      );
-
-      await client.query("DELETE FROM allocations WHERE cam_pool_id = $1", [
-        existingId,
-      ]);
-
-      camPoolId = existingId;
-    } else {
-      const insertPoolResult = await client.query<{ id: string }>(
-        `INSERT INTO cam_pools (property_id, name, year, month, total_expenses, total_rentable_area, status, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
-         RETURNING id`,
-        [
-          propertyId,
-          camPool.name,
-          camPool.year,
-          camPool.month,
-          camPool.total_expenses,
-          camPool.total_rentable_area,
-          camPool.status,
-        ],
-      );
-
-      camPoolId = insertPoolResult.rows[0].id;
-    }
-
-    const insertedAllocations: AllocationResult[] = [];
-
-    for (const allocation of allocations) {
-      allocation.cam_pool_id = camPoolId;
-
-      await client.query(
-        `INSERT INTO allocations (cam_pool_id, tenant_id, rentable_area, pro_rata_share, allocated_amount, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())`,
-        [
-          camPoolId,
-          allocation.tenant_id,
-          allocation.rentable_area,
-          allocation.pro_rata_share,
-          allocation.allocated_amount,
-        ],
-      );
-
-      insertedAllocations.push(allocation);
-    }
-
-    await client.query(
-      `UPDATE expense_line_items
-       SET cam_pool_id = $1, updated_at = NOW()
-       WHERE property_id = $2
-         AND cam_eligible = true
-         AND EXTRACT(YEAR FROM expense_date) = $3
-         ${month ? "AND EXTRACT(MONTH FROM expense_date) = $4" : ""}`,
-      month
-        ? [camPoolId, propertyId, year, month]
-        : [camPoolId, propertyId, year],
-    );
-
-    await client.query("COMMIT");
-
-    return NextResponse.json(
-      {
-        success: true,
-        cam_pool: {
-          id: camPoolId,
-          property_id: propertyId,
-          name: poolName,
-          year,
-          month: month ?? null,
-          total_expenses: totalExpenses,
-          total_rentable_area: totalRentableArea,
-          status: "calculated",
-          expense_count: expenses.length,
-          tenant_count: allocations.length,
-        },
-        allocations: insertedAllocations.map((a) => ({
-          tenant_id: a.tenant_id,
-          tenant_name: a.tenant_name,
-          rentable_area: a.rentable_area,
-          pro_rata_share: Number((a.pro_rata_share * 100).toFixed(4)),
-          allocated_amount: Number(a.allocated_amount.toFixed(2)),
-        })),
-        summary: {
-          total_expenses: Number(totalExpenses.toFixed(2)),
-          total_rentable_area: totalRentableArea,
-          total_allocated: Number(
-            insertedAllocations
-              .reduce((sum, a) => sum + a.allocated_amount, 0)
-              .toFixed(2),
-          ),
-          tenant_count: insertedAllocations.length,
-          expense_count: expenses.length,
-        },
+        return {
+          leaseId: lease.id,
+          tenantId: lease.tenant_id,
+          tenantName: lease.tenant_name,
+          unitId: lease.unit_id,
+          unitNumber: lease.unit_number,
+          rentableSqft: Number(lease.rentable_sqft),
+          sharePercent: parseFloat(sharePercent.toFixed(4)),
+          allocatedAmount: parseFloat(allocatedAmount.toFixed(2)),
+          camCapPct:
+            lease.cam_cap_pct !== null ? Number(lease.cam_cap_pct) : null,
+          camBaseYear:
+            lease.cam_base_year !== null ? Number(lease.cam_base_year) : null,
+        };
       },
-      { status: existingPoolQuery.rows.length > 0 ? 200 : 201 },
     );
+
+    const totalAllocated = camAllocations.reduce(
+      (sum: number, a: { allocatedAmount: number }) => sum + a.allocatedAmount,
+      0,
+    );
+
+    return NextResponse.json({
+      propertyId,
+      propertyName: propertyResult.rows[0].name,
+      year,
+      totalExpenses,
+      totalRentableSqft,
+      totalAllocated: parseFloat(totalAllocated.toFixed(2)),
+      allocations: camAllocations,
+    });
   } catch (error) {
-    await client.query("ROLLBACK");
     console.error("CAM pool calculation error:", error);
-
-    if (error instanceof Error) {
-      return NextResponse.json(
-        { error: "Internal server error", message: error.message },
-        { status: 500 },
-      );
-    }
-
     return NextResponse.json(
       { error: "Internal server error" },
       { status: 500 },
     );
-  } finally {
-    client.release();
   }
 }
